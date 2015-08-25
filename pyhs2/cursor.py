@@ -1,3 +1,5 @@
+#encoding=utf-8
+
 from TCLIService.ttypes import TOpenSessionReq, TGetTablesReq, TFetchResultsReq,\
   TStatusCode, TGetResultSetMetadataReq, TGetColumnsReq, TType, TTypeId, \
   TExecuteStatementReq, TGetOperationStatusReq, TFetchOrientation, TCloseOperationReq, \
@@ -5,6 +7,8 @@ from TCLIService.ttypes import TOpenSessionReq, TGetTablesReq, TFetchResultsReq,
 
 from error import Pyhs2Exception
 import threading
+import re
+import itertools
 
 def get_type(typeDesc):
     for ttype in typeDesc.types:
@@ -21,21 +25,53 @@ def get_type(typeDesc):
         elif ttype.userDefinedTypeEntry is not None:
             return ttype.userDefinedTypeEntry
 
-def get_value(colValue):
-    if colValue.boolVal is not None:
-      return colValue.boolVal.value
-    elif colValue.byteVal is not None:
-      return colValue.byteVal.value
-    elif colValue.i16Val is not None:
-      return colValue.i16Val.value
-    elif colValue.i32Val is not None:
-      return colValue.i32Val.value
-    elif colValue.i64Val is not None:
-      return colValue.i64Val.value
-    elif colValue.doubleVal is not None:
-      return colValue.doubleVal.value
-    elif colValue.stringVal is not None:
-      return colValue.stringVal.value
+def get_col_value(col):
+    # Could directly get index from schema but would need to cache the schema
+    if col.stringVal:
+      return _get_val(col.stringVal)
+    elif col.i16Val is not None:
+      return _get_val(col.i16Val)
+    elif col.i32Val is not None:
+      return _get_val(col.i32Val)
+    elif col.i64Val is not None:
+      return _get_val(col.i64Val)
+    elif col.doubleVal is not None:
+      return _get_val(col.doubleVal)
+    elif col.boolVal is not None:
+      return _get_val(col.boolVal)
+    elif col.byteVal is not None:
+      return _get_val(col.byteVal)
+    elif col.binaryVal is not None:
+      return _get_val(col.binaryVal)
+
+def _get_val(colVal):
+    colVal.values = set_nulls(colVal.values, colVal.nulls)
+    colVal.nulls = '' # Clear the null values for not re-marking again the column with nulls at the next call
+    return colVal.values
+
+def mark_nulls(values, bytestring):
+    mask = bytearray(bytestring)
+
+    for n in mask:
+        yield n & 0x01
+        yield n & 0x02
+        yield n & 0x04
+        yield n & 0x08
+
+        yield n & 0x10
+        yield n & 0x20
+        yield n & 0x40
+        yield n & 0x80
+
+def set_nulls(values, bytestring):
+    if bytestring == '' or re.match('^(\x00)+$', bytestring): # HS2 has just \x00 or '', Impala can have \x00\x00...
+      return values
+    else:
+      #return [None if is_null else value for value, is_null in itertools.izip(values, cls.mark_nulls(values, bytestring))]
+      _values = [None if is_null else value for value, is_null in itertools.izip(values, mark_nulls(values, bytestring))]
+      if len(values) != len(_values): # HS2 can have just \x00\x01 instead of \x00\x01\x00...
+        _values.extend(values[len(_values):])
+      return _values
 
 class Cursor(object):
     session = None
@@ -63,18 +99,28 @@ class Cursor(object):
         if res.status.errorCode is not None:
             raise Pyhs2Exception(res.status.errorCode, res.status.errorMessage)
         
-    def fetch(self):
-        rows = []
+    def ifetch(self):
         while self.hasMoreRows:
-            rows = rows + self.fetchSet()
-        return rows
+             for row in self._ifetchSet():
+                 yield row
 
-    def fetchSet(self):
-        rows = []
+    def _ifetchSet(self):
         fetchReq = TFetchResultsReq(operationHandle=self.operationHandle,
                                     orientation=TFetchOrientation.FETCH_NEXT,
                                     maxRows=10000)
-        self._fetch(rows, fetchReq)
+        return self._ifetch(fetchReq)
+
+    def fetch(self):
+        rows = list()
+        while self.hasMoreRows:
+             rows += self._fetchSet()
+        return rows
+
+    def _fetchSet(self):
+        fetchReq = TFetchResultsReq(operationHandle=self.operationHandle,
+                                    orientation=TFetchOrientation.FETCH_NEXT,
+                                    maxRows=10000)
+        rows = self._fetch(fetchReq)
         return rows
 
     def _fetchBlock(self):
@@ -97,7 +143,7 @@ class Cursor(object):
         fetchReq = TFetchResultsReq(operationHandle=self.operationHandle,
                                     orientation=TFetchOrientation.FETCH_NEXT,
                                     maxRows=self.arraysize)
-        self._standbyBlock = self._fetch([],fetchReq)
+        self._standbyBlock = self._fetch(fetchReq)
         self._blockRequestInProgress = False
         return
 
@@ -217,16 +263,37 @@ class Cursor(object):
     def __exit__(self, _exc_type, _exc_value, _traceback):
         self.close()
 
-    def _fetch(self, rows, fetchReq):
+    def _fetch(self, fetchReq):
         resultsRes = self.client.FetchResults(fetchReq)
-        for row in resultsRes.results.rows:
-            rowData= []
-            for i, col in enumerate(row.colVals):
-                rowData.append(get_value(col))
-            rows.append(rowData)
-        if len(resultsRes.results.rows) == 0:
-            self.hasMoreRows = False
+
+        colValList = self._getValuesFromColBasedRes(resultsRes.results)
+        rows = zip(*colValList)
+
         return rows
+
+    def _ifetch(self, fetchReq):
+        resultsRes = self.client.FetchResults(fetchReq)
+
+        colValList = self._getValuesFromColBasedRes(resultsRes.results)
+        rows = itertools.izip(*colValList)
+
+        return rows
+
+    def _getValuesFromColBasedRes(self, colBasedResults):
+        # 当columns为空，或者其中一列为空
+        if not colBasedResults.columns or not get_col_value(colBasedResults.columns[0]):
+            self.hasMoreRows = False
+
+        columns_list = colBasedResults.columns
+        if not hasattr(columns_list, '__iter__'):
+            return list()
+
+        columns_val_list = list()
+        for column in columns_list:
+            val_list = get_col_value(column)
+            columns_val_list.append(val_list)
+
+        return columns_val_list
 
     def close(self):
         if self.operationHandle is not None:
